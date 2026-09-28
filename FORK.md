@@ -1,10 +1,10 @@
 # Why this fork exists
 
-This fork is a **fix for a problem we are experiencing**: agents that do not belong to the swarm environment were getting their context inflated by that environment's tools.
+This fork is a **fix for a problem in my own context**: the two agents I use — `free` and `local` — were getting their context inflated by tools from an "environment" they do not belong to.
 
 ## The problem
 
-Host agents in OpenCode — agents such as `free` and `local` that run outside the swarm — still had swarm surfaces attached to their sessions: swarm tools, advisories, model-chain overrides and injected state. An "environment" the agent does not belong to was inflating its context with content it never asked for.
+`free` and `local` are the two agents I use in OpenCode, and they run outside the swarm. The swarm plugin attached its surfaces to their sessions anyway: swarm tools, advisories, model-chain overrides and injected state. An "environment" those agents are not part of was inflating their context with content they never asked for.
 
 ## The fix
 
