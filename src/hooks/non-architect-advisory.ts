@@ -1,4 +1,8 @@
 import { ALL_SUBAGENT_NAMES } from '../config/agent-names';
+// Host-internal OpenCode agents that never carry user chat (the
+// user-selectable built-ins are build/plan/general/explore). The advisory must
+// not fire for internal housekeeping agents.
+import { HOST_INTERNAL_AGENT_NAMES } from '../config/host-agent-boundary';
 import { stripKnownSwarmPrefix } from '../config/schema';
 import { ensureAgentSession, swarmState } from '../state';
 import { pushAdvisory } from '../utils/advisory-queue';
@@ -14,11 +18,6 @@ import { pushAdvisory } from '../utils/advisory-queue';
  * the existing session-state eviction) — no new module-level session map.
  */
 export const NON_ARCHITECT_ADVISORY_KEY = '[non-architect-advisory]';
-
-// Host-internal OpenCode agents that never carry user chat (the
-// user-selectable built-ins are build/plan/general/explore). The advisory must
-// not fire for internal housekeeping agents.
-const HOST_INTERNAL_AGENTS = new Set(['compaction', 'title', 'summary']);
 
 // Swarm subagent roles (coder/reviewer/critic/...) run in Task-spawned child
 // sessions where "switch to an architect" is inactionable and the gated
@@ -39,7 +38,7 @@ export function maybeEmitNonArchitectAdvisory(
 	if (!sessionID || !agentName.trim()) return false;
 	const role = stripKnownSwarmPrefix(agentName);
 	if (role === 'architect') return false;
-	if (HOST_INTERNAL_AGENTS.has(role)) return false;
+	if (HOST_INTERNAL_AGENT_NAMES.has(role)) return false;
 	if (SWARM_SUBAGENT_ROLES.has(role)) return false;
 
 	const session =

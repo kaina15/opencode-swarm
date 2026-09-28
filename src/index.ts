@@ -55,6 +55,10 @@ import {
 	ORCHESTRATOR_NAME,
 	SUMMARIZER_EXEMPT_TOOL_NAMES,
 } from './config/constants';
+import {
+	classifyHostAgentName,
+	findExcludedFromSwarmGeneratedNameConflicts,
+} from './config/host-agent-boundary';
 import { resolveWorktreeIsolationConfig } from './config/index.js';
 import { writeSwarmConfigExampleIfNew } from './config/project-init';
 import {
@@ -326,6 +330,7 @@ import {
 } from './telemetry';
 import { buildPluginToolObject } from './tools/plugin-registration';
 import { reconcilePrWorkflowCheckoutReceipts } from './tools/prepare-pr-workflow-checkout.js';
+import { TOOL_NAME_SET, TOOL_NAMES } from './tools/tool-names';
 import { createTrainingCaptureObserver } from './training/capture.js';
 import { error, log, warn } from './utils';
 import { pushAdvisory } from './utils/advisory-queue';
@@ -1923,6 +1928,95 @@ async function initializeOpenCodeSwarm(
 	// `architect` via suffix-only matching and slip past the delegation
 	// guard (adversarial review C1 fix).
 	swarmState.generatedAgentNames = [...instanceGeneratedAgentNames];
+
+	// Host-agent exclusion (host_agents.excluded_from_swarm): exact-name host
+	// agents (e.g. `free`, `local`) stay selectable in OpenCode but skip every
+	// swarm surface — no state, no advisory, no model fallback, no injection,
+	// and no delegation into generated swarm agents. The chat.message hook
+	// records the limited session identity on the EXISTING bounded
+	// activeAgent map (invariant 8: no new session map). The generated-agent
+	// registry remains the positive authority, so `local` never collides with
+	// `local_architect`.
+	const excludedHostAgentNames = config?.host_agents?.excluded_from_swarm ?? [];
+	const classifyHostAgentSession = (agentName: string) =>
+		classifyHostAgentName(agentName, {
+			excludedFromSwarm: excludedHostAgentNames,
+			generatedAgentNames: instanceGeneratedAgentNames,
+		});
+	const isExcludedHostAgentSession = (sessionID: unknown): boolean => {
+		if (excludedHostAgentNames.length === 0) return false;
+		if (typeof sessionID !== 'string' || sessionID.length === 0) return false;
+		const mapped = swarmState.activeAgent.get(sessionID);
+		return (
+			typeof mapped === 'string' &&
+			classifyHostAgentSession(mapped) === 'excluded-host-agent'
+		);
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
+	type HostAgentGuardHandler = (input: any, output: any) => Promise<unknown>;
+	const guardExcludedHostAgentMessages = (
+		handler: HostAgentGuardHandler,
+	): HostAgentGuardHandler => {
+		return async (input, output) => {
+			if (excludedHostAgentNames.length === 0) {
+				return handler(input, output);
+			}
+			const ctx = resolveMessageTransformContext(output as MessageArrayLike);
+			if (
+				(typeof ctx.agent === 'string' &&
+					classifyHostAgentSession(ctx.agent) === 'excluded-host-agent') ||
+				isExcludedHostAgentSession(ctx.sessionID)
+			) {
+				return undefined;
+			}
+			return handler(input, output);
+		};
+	};
+	const guardExcludedHostAgentSystem = (
+		handler: HostAgentGuardHandler,
+	): HostAgentGuardHandler => {
+		return async (input, output) => {
+			if (excludedHostAgentNames.length === 0) {
+				return handler(input, output);
+			}
+			if (isExcludedHostAgentSession(input?.sessionID)) return undefined;
+			return handler(input, output);
+		};
+	};
+	const resolveEventSessionID = (event: unknown): string | undefined => {
+		const evt = event as
+			| {
+					properties?: {
+						sessionID?: unknown;
+						sessionId?: unknown;
+						id?: unknown;
+						part?: { sessionID?: unknown };
+						info?: { sessionID?: unknown; id?: unknown };
+					};
+					data?: { sessionID?: unknown; sessionId?: unknown };
+			  }
+			| undefined;
+		const candidates = [
+			evt?.properties?.sessionID,
+			evt?.properties?.sessionId,
+			evt?.properties?.part?.sessionID,
+			evt?.properties?.info?.sessionID,
+			evt?.properties?.info?.id,
+			evt?.properties?.id,
+			evt?.data?.sessionID,
+			evt?.data?.sessionId,
+		];
+		for (const candidate of candidates) {
+			if (typeof candidate === 'string' && candidate.length > 0) {
+				return candidate;
+			}
+		}
+		return undefined;
+	};
+	const isSessionDeletionEvent = (event: unknown): boolean => {
+		const type = (event as { type?: unknown } | undefined)?.type;
+		return type === 'session.deleted' || type === 'session.removed';
+	};
 
 	const pipelineHook = createPipelineTrackerHook(config, bootstrapRoot);
 	const systemEnhancerHook = createSystemEnhancerHook(config, bootstrapRoot);
@@ -3764,6 +3858,21 @@ async function initializeOpenCodeSwarm(
 		// or plugin load. The observer is opt-in and fail-closed.
 		event: async (input: { event: unknown }): Promise<void> => {
 			try {
+				// Host-agent exclusion: every swarm surface is skipped for
+				// events attributed to an excluded host session (cost
+				// telemetry, delegation metadata, PR delivery, background
+				// observers). Session deletion still releases the bounded
+				// identity entry.
+				const excludedEventSessionID = resolveEventSessionID(input.event);
+				if (isExcludedHostAgentSession(excludedEventSessionID)) {
+					if (
+						excludedEventSessionID &&
+						isSessionDeletionEvent(input.event)
+					) {
+						swarmState.activeAgent.delete(excludedEventSessionID);
+					}
+					return;
+				}
 				const rememberedUsage = rememberAssistantUsageEvent(input);
 				if (rememberedUsage) {
 					const corrected = emitPendingCostCorrection(
@@ -4053,6 +4162,56 @@ async function initializeOpenCodeSwarm(
 
 			// Merge agent configs (don't override default_agent)
 			Object.assign(agentConfig, agents);
+
+			// Host-agent exclusion (host_agents.excluded_from_swarm): deny the
+			// plugin tool surface on the listed host agents with the repo's
+			// canonical permission-deny mechanism (the same `deny` entries
+			// generated agents get from buildPermissionBlock). The agents stay
+			// selectable in OpenCode; only the swarm tool wave is denied. A
+			// listed name absent from the resolved config warns (never a
+			// phantom entry), and a name that is also a generated swarm agent
+			// is skipped with a diagnostic (positive authority wins).
+			if (excludedHostAgentNames.length > 0) {
+				const excludedConflicts =
+					findExcludedFromSwarmGeneratedNameConflicts(
+						excludedHostAgentNames,
+						instanceGeneratedAgentNames,
+					);
+				for (const excludedConflict of excludedConflicts) {
+					addDeferredWarning(
+						`[swarm] host_agents.excluded_from_swarm lists "${excludedConflict}", which is a generated swarm agent name; the generated agent is unaffected — remove it from the exclusion list to silence this warning.`,
+					);
+				}
+				for (const excludedName of excludedHostAgentNames) {
+					if (excludedConflicts.includes(excludedName)) continue;
+					const excludedAgentConfig = agentConfig[excludedName];
+					if (!isObjectRecord(excludedAgentConfig)) {
+						addDeferredWarning(
+							`[swarm] host_agents.excluded_from_swarm lists "${excludedName}", but no host agent with that exact name is configured; no swarm tools were denied for it.`,
+						);
+						continue;
+					}
+					// Canonical gate: permission-block denies (host's
+					// Permission.disabled path). Appended AFTER existing
+					// entries so they win under the host's findLast precedence.
+					const permission = isObjectRecord(excludedAgentConfig.permission)
+						? { ...excludedAgentConfig.permission }
+						: {};
+					for (const toolName of TOOL_NAMES) {
+						permission[toolName] = 'deny';
+					}
+					excludedAgentConfig.permission = permission;
+					// Reinforcement only (documented as the legacy inert map):
+					// never the primary guarantee.
+					const tools = isObjectRecord(excludedAgentConfig.tools)
+						? { ...excludedAgentConfig.tools }
+						: {};
+					for (const toolName of TOOL_NAMES) {
+						tools[toolName] = false;
+					}
+					excludedAgentConfig.tools = tools;
+				}
+			}
 
 			// Worktree-lane permission scoping.
 			//
@@ -4696,7 +4855,8 @@ async function initializeOpenCodeSwarm(
 		// result untouched and only records the first-turn interval when the
 		// invocation settles — no extra awaits, no argument writes, no
 		// rebinding (invariant 10 in-place mutation contract unaffected).
-		'experimental.chat.messages.transform': withStartupFirstUseTracking(
+		'experimental.chat.messages.transform': guardExcludedHostAgentMessages(
+			withStartupFirstUseTracking(
 			'first_turn',
 			undefined,
 			composeHandlers(
@@ -4759,17 +4919,24 @@ async function initializeOpenCodeSwarm(
 				].filter((fn): fn is NonNullable<typeof fn> => Boolean(fn)),
 				// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
 			) as any,
-			// biome-ignore lint/suspicious/noExplicitAny: observation wrapper preserves the any-typed hook surface
+				// biome-ignore lint/suspicious/noExplicitAny: observation wrapper preserves the any-typed hook surface
+			) as any,
 		) as any,
 
 		// Correctness boundary: while a durable PR workflow gate exists, architect
 		// text is prepended with a workflow-active banner so it cannot masquerade
 		// as a terminal verdict or closure response. Raw-await this hook so
 		// gate-state read failures block text completion.
-		'experimental.text.complete': prWorkflowResponseGate.textComplete,
+		'experimental.text.complete': (async (input: any, output: any) => {
+			// Host-agent exclusion: no swarm surface for excluded sessions.
+			if (isExcludedHostAgentSession(input?.sessionID)) return;
+			await prWorkflowResponseGate.textComplete(input, output);
+			// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
+		}) as any,
 
 		// Inject system prompt enhancements + phase monitor (when phase_preflight or knowledge enabled)
-		'experimental.chat.system.transform': composeHandlers(
+		'experimental.chat.system.transform': guardExcludedHostAgentSystem(
+			composeHandlers(
 			...([
 				systemTransformStartDiagnostic,
 				systemEnhancerHook['experimental.chat.system.transform'],
@@ -4818,6 +4985,7 @@ async function initializeOpenCodeSwarm(
 			>),
 			// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
 		) as any,
+		) as any,
 
 		// Handle session compaction. Two obligations live here, deliberately in
 		// one always-registered wrapper (issue #2533):
@@ -4836,20 +5004,28 @@ async function initializeOpenCodeSwarm(
 			output: unknown,
 		) => {
 			const { sessionID } = (input ?? {}) as { sessionID?: string };
+			const excludedHostSession =
+				typeof sessionID === 'string' &&
+				isExcludedHostAgentSession(sessionID);
 			if (sessionID) {
-				_architectCompactionPending.delete(sessionID);
-				_architectCompactionPending.set(sessionID, true);
-				capSessionMap(
-					_architectCompactionPending,
-					MAX_TRACKED_ARCHITECT_COMPACTIONS,
-					sessionID,
-				);
+				if (!excludedHostSession) {
+					_architectCompactionPending.delete(sessionID);
+					_architectCompactionPending.set(sessionID, true);
+					capSessionMap(
+						_architectCompactionPending,
+						MAX_TRACKED_ARCHITECT_COMPACTIONS,
+						sessionID,
+					);
+				}
+				// Invariant #2107 §4: the per-turn ledger advance must fire on
+				// EVERY host compaction; excluded host sessions skip only the
+				// swarm-specific writes and the customizer delegate.
 				advanceTurnGeneration(sessionID);
 			}
 			const delegate = compactionHook['experimental.session.compacting'] as
 				| ((input: unknown, output: unknown) => Promise<void>)
 				| undefined;
-			if (typeof delegate === 'function') {
+			if (typeof delegate === 'function' && !excludedHostSession) {
 				await delegate(input, output);
 			}
 			// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
@@ -4857,7 +5033,13 @@ async function initializeOpenCodeSwarm(
 
 		// Handle /swarm commands
 		// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
-		'command.execute.before': safeHook(commandHandler) as any,
+		'command.execute.before': (async (input: any, output: any) => {
+			// Host-agent exclusion: /swarm commands are a swarm surface — an
+			// excluded session never routes them.
+			if (isExcludedHostAgentSession(input?.sessionID)) return;
+			await safeHook(commandHandler)(input, output);
+			// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
+		}) as any,
 
 		// Track tool usage + guardrails
 		// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
@@ -4867,6 +5049,46 @@ async function initializeOpenCodeSwarm(
 				console.error(
 					`[DIAG] toolBefore tool=${normalizeToolName(input.tool) ?? input.tool} session=${input.sessionID}`,
 				);
+			// Host-agent exclusion (first stage, before any swarm bookkeeping):
+			// a session running an excluded host agent may use host/MCP tools,
+			// but can never invoke a swarm tool nor dispatch into a generated
+			// swarm agent. External tools and external delegations return
+			// untouched, skipping the ENTIRE swarm pipeline. An unmapped
+			// session cannot be classified (fail-open, documented): the
+			// config-level permission deny remains the primary gate.
+			if (isExcludedHostAgentSession(input.sessionID)) {
+				const excludedSessionAgent =
+					swarmState.activeAgent.get(input.sessionID) ?? 'unknown';
+				const normalizedExcludedTool =
+					normalizeToolName(input.tool) ?? input.tool;
+				if (
+					(TOOL_NAME_SET as ReadonlySet<string>).has(normalizedExcludedTool)
+				) {
+					throw new Error(
+						`SWARM_HOST_AGENT_EXCLUDED: host agent "${excludedSessionAgent}" is excluded from the swarm; tool "${normalizedExcludedTool}" is unavailable in this session.`,
+					);
+				}
+				if (isTaskToolId(input.tool)) {
+					const dispatchArgs = output?.args as
+						| { subagent_type?: unknown; agent?: unknown }
+						| undefined;
+					const targetAgent =
+						typeof dispatchArgs?.subagent_type === 'string'
+							? dispatchArgs.subagent_type
+							: typeof dispatchArgs?.agent === 'string'
+								? dispatchArgs.agent
+								: undefined;
+					if (
+						targetAgent !== undefined &&
+						instanceGeneratedAgentNames.includes(targetAgent)
+					) {
+						throw new Error(
+							`SWARM_HOST_AGENT_EXCLUDED: host agent "${excludedSessionAgent}" is excluded from the swarm and cannot dispatch generated swarm agent "${targetAgent}".`,
+						);
+					}
+				}
+				return;
+			}
 			// If no active agent is mapped for this session, it's the primary agent (architect)
 			// Subagent delegations always set activeAgent via chat.message before tool calls
 			if (!swarmState.activeAgent.has(input.sessionID)) {
@@ -5367,6 +5589,9 @@ async function initializeOpenCodeSwarm(
 				console.error(
 					`[DIAG] toolAfter START tool=${_toolName} session=${input.sessionID}`,
 				);
+
+			// Host-agent exclusion: no swarm bookkeeping for excluded sessions.
+			if (isExcludedHostAgentSession(input.sessionID)) return;
 
 			const isTaskTool = isTaskToolId(input.tool);
 			// (#1849) Resolve tool.execute.after args ONCE from the callID snapshot
@@ -6031,6 +6256,23 @@ async function initializeOpenCodeSwarm(
 		// Track agent delegations and active agent
 		// biome-ignore lint/suspicious/noExplicitAny: Plugin API requires generic hook wrappers
 		'chat.message': (async (input: any, output: any) => {
+			// Host-agent exclusion: a session running an excluded host agent
+			// (e.g. free/local) records its limited identity on the existing
+			// bounded activeAgent map and skips EVERY swarm surface — no
+			// model-chain preflight, advisory, model override, live-context
+			// seed, delegation handler, cohort cache, or full-auto cadence.
+			if (
+				input?.sessionID &&
+				typeof input?.agent === 'string' &&
+				classifyHostAgentSession(String(input.agent)) ===
+					'excluded-host-agent'
+			) {
+				swarmState.activeAgent.set(
+					String(input.sessionID),
+					String(input.agent),
+				);
+				return;
+			}
 			// Model-chain exhaustion is a blocking request-boundary condition. Keep
 			// this preflight outside safeHook so the host cannot silently continue on
 			// the primary/default model after every configured model is exhausted.

@@ -3660,6 +3660,41 @@ export const DashboardConfigSchema = z
 export type DashboardConfig = z.infer<typeof DashboardConfigSchema>;
 
 /**
+ * Host agents the user excludes from swarm behavior by exact name.
+ *
+ * `free` and `local` are host-provided agents the user may keep selectable
+ * while opting them out of every swarm hook. The list is normalized the same
+ * way as `normalizeExcludedFromSwarm` (trimmed, empty dropped, de-duplicated,
+ * capped at 64), and an absent `excluded_from_swarm` key resolves to `[]` so a
+ * present-but-empty `host_agents` section is well-defined. Duplicate names
+ * (after trimming) are rejected with a custom issue.
+ */
+export const HostAgentsConfigSchema = z
+	.object({
+		excluded_from_swarm: z
+			.array(z.string().trim().min(1))
+			.max(64)
+			.superRefine((names, ctx) => {
+				const seen = new Set<string>();
+				names.forEach((name, index) => {
+					const normalized = name.trim();
+					if (seen.has(normalized)) {
+						ctx.addIssue({
+							code: 'custom',
+							path: [index],
+							message: `Duplicate host-agent name "${normalized}" in host_agents.excluded_from_swarm.`,
+						});
+					}
+					seen.add(normalized);
+				});
+			})
+			.optional()
+			.transform((v) => v ?? []),
+	})
+	.strict();
+export type HostAgentsConfig = z.infer<typeof HostAgentsConfigSchema>;
+
+/**
  * Issue #2384: deprecated transcript-row settlement for Profile A PR-review
  * base/micro discovery lanes is an explicit compatibility opt-in. Omitted
  * config resolves false in consumers; legacy transcript parsing remains a
@@ -3718,6 +3753,13 @@ export const PluginConfigSchema = z.object({
 		.describe(
 			'Per-agent overrides keyed by agent name for the default swarm (e.g. "architect", "coder"). Multi-swarm setups configure agents under swarms.<id>.agents instead.',
 		),
+
+	// Host agents excluded from swarm behavior by exact name (e.g. "free",
+	// "local"). Excluded agents stay selectable but skip swarm hooks; exact
+	// match only, and an absent key resolves to [].
+	host_agents: HostAgentsConfigSchema.optional().describe(
+		'Host agents excluded from the swarm by exact name (e.g. "free", "local"). Excluded agents remain selectable but skip swarm logic; exact match, trimmed, de-duplicated, max 64; default [].',
+	),
 
 	// Default agent — specifies which agent is set as primary mode.
 	//

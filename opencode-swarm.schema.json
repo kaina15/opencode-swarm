@@ -89,6 +89,21 @@
         }
       }
     },
+    "host_agents": {
+      "description": "Host agents excluded from the swarm by exact name (e.g. \"free\", \"local\"). Excluded agents remain selectable but skip swarm logic; exact match, trimmed, de-duplicated, max 64; default [].",
+      "type": "object",
+      "properties": {
+        "excluded_from_swarm": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "default_agent": {
       "description": "Agent set as the primary mode. Omitted: every generated *_architect is primary. Exact generated name (e.g. \"local_architect\"): only that agent. Base role name (e.g. \"coder\"): every generated agent with that base role. Unknown strings warn once and fall back to architect primaries.",
       "type": "string"
